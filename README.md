@@ -1,7 +1,7 @@
 # quantum_readiness_spray.py
 Masscan + hand-rolled SSH/RDP/TLS probes to assess post-quantum crypto readiness across a subnet — rates every server Ready/Capable/Planning Required/Legacy/Unknown, outputs a color-coded Excel/CSV report.
 
-# quantum_readiness_spray.py
+# Overview
 
 Subnet-wide post-quantum-readiness sweep across SSH, RDP, and HTTPS, built
 the same way as `ssh_vuln_scan.py` / `sslspray.py`: masscan for fast
