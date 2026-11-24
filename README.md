@@ -1,24 +1,29 @@
 # quantum_readiness_spray.py
+
 Masscan + hand-rolled SSH/RDP/TLS probes to assess post-quantum crypto readiness across a subnet — rates every server Ready/Capable/Planning Required/Legacy/Unknown, outputs a color-coded Excel/CSV report.
 
 # Overview
 
 Subnet-wide post-quantum-readiness sweep across SSH, RDP, and HTTPS, built
 the same way as `ssh_vuln_scan.py` / `sslspray.py`: masscan for fast
-discovery, then a worker pool for the actual assessment, with the same live
-progress bar / logging conventions. Single Python file — scan, parse, CSV,
-and `.xlsx` are all in it. This is the original tool in the family; the SSH
-and SSL/TLS sibling scripts were both split out of the pattern it
-established.
+discovery, a concurrent reverse-DNS pass, then a worker pool for the actual
+assessment, with the same live progress bar / logging conventions. Single
+Python file — scan, parse, CSV, and `.xlsx` are all in it. This is the
+original tool in the family; the SSH and SSL/TLS sibling scripts were both
+split out of the pattern it established.
 
 ## What it finds
 
 For every SSH (22), RDP (3389), and HTTPS (443) server in scope, whether it
 shows real evidence of post-quantum / hybrid cryptography, by comparing what
 the server actually offers or negotiates against known PQC/hybrid
-identifiers (e.g. OpenSSL's `X25519MLKEM768`-family key-exchange codepoints).
-Every host is placed into one of five assessment buckets — **our**
-categories for this engagement, not official NIST labels:
+identifiers — OpenSSH's hybrid key-exchange algorithms
+(`mlkem768x25519-sha256`, `sntrup761x25519-sha512`, and the older
+`sntrup4591761x25519-sha512@tinyssh.org`), its new `ssh-mldsa44-ed25519`
+post-quantum host-key signature, and the IANA-registered TLS hybrid
+key-exchange groups (the `X25519MLKEM768` family, plus the still-deployed
+pre-standard Kyber drafts). Every host is placed into one of five assessment
+buckets — **our** categories for this engagement, not official NIST labels:
 
 | Rating | Meaning |
 |---|---|
@@ -69,6 +74,27 @@ which hosts across all configured subnets have TCP/22, TCP/3389, or TCP/443
 open, in a fraction of the time. **Phase 2** then only touches real hosts,
 one worker per host/port pair, running the protocol-appropriate probe above.
 
+A third, lighter-weight phase sits between them — see below.
+
+## Why DNS resolution gets its own phase
+
+Reverse DNS used to happen inline, one blocking `gethostbyaddr()` call per
+host, serially, before Phase 2 could start. That's fine when lookups
+succeed quickly, but an unresolvable host doesn't fail fast — the OS
+resolver commonly takes ~5 seconds to give up — and a few hundred of those
+in a row turned into many minutes of silent dead time with no progress bar
+covering it.
+
+**Phase 1.5** fixes this by resolving every *unique* IP (not every
+host/port pair, so a host running all three services costs one lookup
+instead of three) through the same worker pool used in Phase 2, with its
+own live progress line. Measured locally: 24 deliberately unresolvable
+lookups took 4.6 seconds pooled versus roughly 110 seconds serially.
+`--dns-timeout` is advisory only — `gethostbyaddr()` is a blocking OS call
+that ignores Python's socket timeout, so concurrency (`--workers`), not
+this flag, is what actually bounds the phase. `--skip-dns` skips it
+entirely when hostnames aren't needed.
+
 ## Scope
 
 ```python
@@ -86,7 +112,9 @@ SUBNETS: List[str] = [
 ```
 
 Edit this list in the script to change scope — same convention as the
-sibling scripts.
+sibling scripts. A commented-out entry (like `6.0.0.0/16` above) is simply
+skipped, which is handy for temporarily dropping a range from scope without
+losing it.
 
 ## Requirements
 
@@ -110,10 +138,12 @@ Common options:
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--workers` | `30` | Concurrent probes in Phase 2. Higher than the SSH/TLS sibling scripts' worker counts — each unit of work here is a handful of raw socket reads/writes, not a full external process, so it's much cheaper per worker. |
+| `--workers` | `50` | Concurrency for both DNS resolution and Phase 2 probes — the main speed lever. Higher than the SSH/TLS sibling scripts' worker counts, since each unit of work here is a handful of raw socket reads/writes, not a full external process. |
 | `--rate` | `25000` | masscan packets/sec |
 | `--timeout` | `4.0` | Per-probe socket timeout, in seconds |
 | `--retries` | `1` | Retries per host if a scan comes back empty (covers a transient miss) |
+| `--skip-dns` | off | Skip reverse-DNS resolution entirely; hostnames report as `UNKNOWN` and HTTPS probes omit SNI |
+| `--dns-timeout` | `2.0` | Advisory reverse-DNS timeout — see "Why DNS resolution gets its own phase" above |
 | `--output-dir` | script's own directory | Where the log/CSV/xlsx are written |
 | `--ssh-audit-path` | `ssh-audit` | Path to the ssh-audit executable |
 | `--interface` | *(none)* | Passed to masscan's `-e` |
@@ -170,6 +200,14 @@ inserted here).
 `-oL` list-output parsing, same dedup-by-key approach, generalized here to
 three ports (`T:22,3389,443`) instead of one.
 
+**Phase 1.5 (DNS)** resolves the set of unique IPs through the same
+`ThreadPoolExecutor` pattern as Phase 2, rather than blocking serially on
+`socket.gethostbyaddr()` per host/port pair. It sets Python's process-global
+socket default timeout once for the whole phase rather than per lookup —
+doing it per lookup was tried first and found to race as soon as lookups
+run concurrently, leaving the global timeout wrong for everything that
+follows.
+
 **Phase 2** is a worker pool of raw Python socket probes (not external
 processes) — `probe_ssh`, `probe_rdp`, and `probe_https` each open their own
 socket directly, since no combination of off-the-shelf tools covers this
@@ -178,7 +216,9 @@ way nmap+NSE does for the sibling scripts.
 
 **Retry logic** matches the sibling scripts' "only retry a `No
 Response`-shaped outcome" pattern — this is the tool the pattern was
-originally built for.
+originally built for. A definitive result (a real rating, or a hard error)
+is never retried, only timeouts/refused connections/no-banner-shaped
+failures that plausibly reflect transient packet loss.
 
 ## Limitations
 
@@ -200,12 +240,16 @@ reading the server's KEXINIT (SSH), well before anything resembling a
 completed, trustable connection.
 
 **Reverse DNS depends on corporate DNS infrastructure**; failures resolve
-to `"UNKNOWN"` and do not stop the scan.
+to `"UNKNOWN"` and do not stop the scan. `--dns-timeout` is advisory, not a
+hard bound — see "Why DNS resolution gets its own phase" above.
 
-**Assesses only SSH, RDP, and HTTPS** — no other protocol is in scope for
-this tool. (SSL/TLS protocol-version legacy detection more broadly — SSLv2/
-SSLv3/TLS1.0-1.3 support, independent of PQC readiness — was split out into
-the separate `sslspray.py` sibling instead of being added here.)
+**Assesses only SSH, RDP, and HTTPS, and only on their standard ports**
+(22/3389/443) — no other protocol, and no alternate TLS ports (8443, 9443,
+and similar appliance/management-UI ports are not scanned), are in scope
+for this tool. (SSL/TLS protocol-version legacy detection more broadly —
+SSLv2/SSLv3/TLS1.0-1.3 support, independent of PQC readiness — was split
+out into the separate `sslspray.py` sibling instead of being added here.)
 
 **Ctrl+C behavior**: first interrupt finishes in-flight work and writes
-partial reports; second interrupt force-exits.
+partial reports; second interrupt force-exits. This applies across all
+three phases.
